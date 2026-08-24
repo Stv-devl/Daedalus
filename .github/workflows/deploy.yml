@@ -1,0 +1,222 @@
+# CD — what leaves the machine.
+#
+# `.claude/commands/ship.md` separates two families of gates: those that decide
+# **what is built** (`/interface`, `/plan`) and those that decide **what ships**
+# (push, PR, merge). This file belongs to the second family, and it is its last
+# link.
+#
+# Four properties, and none of them is optional:
+#
+#   1. It deploys ONLY what a green CI produced. No exception: the manual
+#      trigger itself goes and fetches the latest **successful** CI run instead
+#      of rebuilding. A deployment that can start on a red is not a CD, it is an
+#      `scp` with extra steps.
+#   2. It deploys the ARTIFACT of that run, never a rebuild. Rebuilding means
+#      shipping a binary nothing tested — same commit, different output, and
+#      nobody sees it go by.
+#   3. The JOB provides the environment, the `Publish` step never assumes it.
+#      See the `steps:` block: this is the property whose omission is silent.
+#   4. `environment:` is the human validation. Configure the required reviewer
+#      in Settings → Environments, or this file deploys on its own.
+#
+# The `Publish` step is the only thing that depends on your host, and it is not
+# written here: `install.sh` inserted it from
+# `templates/github/publish/<target>.yml` when you picked the target
+# (`--deploy=`, or the question the installer asked). Each snippet carries the
+# exact list of secrets and variables to create on the GitHub side.
+#
+# Changing your mind later: re-run `./install.sh <project> --deploy=<other>` and
+# merge the `deploy.yml.new` it writes next to this one.
+
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # never cancel a deployment in flight
+
+# Least privilege: `contents: read` and nothing else by default. A target that
+# requires more (Pages, GHCR) had its line added here by the installer, from its
+# `.perms` file — never granted "just in case".
+permissions:
+  contents: read
+  actions: read # required to read the runs and the artifact of ANOTHER workflow
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # On `workflow_run`, we only start if the CI concluded green. On
+    # `workflow_dispatch` there is no triggering run: the guarantee moves to the
+    # "Resolve" step below, which refuses to continue if there is no green CI
+    # run to deploy.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    # The whole block comes from the `<target>.environment` fragment when it
+    # exists: Pages imposes its environment name AND builds its own URL, so both
+    # lines must be able to vary together. With no fragment, the default.
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Which run to deploy?
+      #
+      # This step is the correction of a real defect: the manual trigger ran a
+      # `pnpm install && pnpm build` from an arbitrary checkout, so it deployed
+      # a binary no gate had seen — in direct contradiction with property #1
+      # this file claims.
+      #
+      # There is no "rebuild" branch any more. Both triggers resolve a
+      # successful CI run, and only its artifact is deployed.
+      # ------------------------------------------------------------------
+      - name: Resolve the CI run to deploy
+        id: run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_run" ]; then
+            id="$RUN_ID"; sha="$RUN_SHA"
+          else
+            # Manual dispatch: the latest GREEN CI on the default branch.
+            # No green run → we stop, rather than deploy something else.
+            # `|| true`: without it, a failing `gh` (network, token) makes
+            # `read` return 1, and `set -e` kills the step BEFORE the message
+            # below — the guard only covered the "no green run" case, not the
+            # "gh is broken" one. Both lead here now.
+            id=""; sha=""
+            read -r id sha < <(gh run list --workflow=CI --branch="$DEFAULT_BRANCH" \
+              --status=success --limit=1 \
+              --json databaseId,headSha --jq '.[0] | "\(.databaseId) \(.headSha)"') || true
+            if [ -z "$id" ] || [ "$id" = "null" ]; then
+              echo "No usable green CI run on $DEFAULT_BRANCH." >&2
+              echo "Causes: no successful run, or 'gh run list' failed." >&2
+              exit 1
+            fi
+            echo "Manual dispatch: deploying CI run $id ($sha)."
+            # If that run is older than `retention-days` (7 in ci.yml), its
+            # artifact has expired and the download below will fail on a message
+            # that does not say so. Re-running the CI on the default branch
+            # fixes it; raising the retention in ci.yml is the other option.
+          fi
+          echo "id=$id"   >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 2. Setup — UNCONDITIONAL, and that is a correction, not over-zeal.
+      #
+      # These steps were first guarded by `workflow_dispatch`, on the grounds
+      # that "the normal path only needs dist/". That is true of exactly one
+      # target (netlify --dir=dist) and false of every other:
+      #   - ghcr    : `context: .` with no checkout finds no Dockerfile;
+      #   - vercel  : `pnpm dlx` with no setup → `pnpm: command not found`, pnpm
+      #     NOT being preinstalled on the ubuntu-22.04 / 24.04 images (npm and
+      #     yarn are, it is not);
+      #   - netlify : same.
+      # A publish step cannot assume the job's environment: the skeleton
+      # provides it, once, for everyone.
+      #
+      # ORDER MATTERS: checkout BEFORE downloading the artifact.
+      # `actions/checkout` cleans the workspace (`clean: true` by default) and
+      # would erase an already-downloaded `dist/`.
+      #
+      # `ref:` is explicit: checkout's default is the head of the default
+      # branch, NOT the commit of the run resolved above. Without that line we
+      # would deploy one commit's dist/ with another commit's Dockerfile and
+      # host config.
+      # ------------------------------------------------------------------
+      - name: Checkout the commit that produced the build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.run.outputs.sha }}
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      # The checkout above does not undermine property #2: it brings the SOURCES
+      # (Dockerfile, host config), never the published bytes. Those come out of
+      # this artifact, and out of it alone.
+      - name: Download the build the CI produced
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ steps.run.outputs.sha }}
+          path: dist
+          run-id: ${{ steps.run.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # 3. SPA fallback — before publishing, never after.
+      #
+      # The stack is TanStack Router (`01-stack.md`), so CLIENT-side routing:
+      # the server knows one real file, `index.html`. Navigating to /settings
+      # works (it is JS); RELOADING /settings asks the server for a file that
+      # does not exist. Without this step the site looks fine and breaks on the
+      # first F5, on a shared link.
+      #
+      # Each target has its own form; those that do not need one here (ssh,
+      # ghcr) carry it in their nginx, and their snippet says so.
+      # ------------------------------------------------------------------
+      # Build Output API: `handle: filesystem` serves the real files first
+      # (hashed assets, favicon), and only then does everything else fall
+      # through to index.html. Without the `handle`, the rule catches the assets
+      # TOO and the site serves HTML in place of JS.
+      - name: SPA fallback
+        run: |
+          mkdir -p .vercel/output
+          cat > .vercel/output/config.json <<'JSON'
+          {
+            "version": 3,
+            "routes": [
+              { "handle": "filesystem" },
+              { "src": "/.*", "dest": "/index.html" }
+            ]
+          }
+          JSON
+
+      # Vercel. `config.json` is written by the "SPA fallback" step above — it
+      # carries the `routes`, so it is not rewritten here.
+      #
+      # The token goes through `env` and NOT through `--token=`: a command-line
+      # argument is readable in the runner's process list, and the CLI reads
+      # `VERCEL_TOKEN` from the environment anyway.
+      #
+      # This target's trap: `vercel deploy` without `--prebuilt` REBUILDS on
+      # Vercel's side, which breaks property #2 — you would deploy a binary the
+      # CI never tested. So we rebuild the "Build Output API" tree from the CI's
+      # dist/, and `--prebuilt` publishes exactly that.
+      #
+      # To create on the GitHub side — Settings → Secrets and variables →
+      # Actions:
+      #   secret  VERCEL_TOKEN         (Account settings → Tokens)
+      #   secret  VERCEL_ORG_ID        (.vercel/project.json after `vercel link`)
+      #   secret  VERCEL_PROJECT_ID    (same)
+      #   var     PRODUCTION_URL
+      - name: Publish
+        run: |
+          mkdir -p .vercel/output/static
+          cp -r dist/. .vercel/output/static/
+          pnpm dlx vercel deploy --prebuilt --prod
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}

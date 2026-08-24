@@ -1,0 +1,62 @@
+[project]
+name = "daedalus-agents"
+version = "0.0.0"
+description = "Daedalus agent service — FastAPI backend behind the React front end"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.118",
+    "uvicorn[standard]>=0.37",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.10",
+    "sqlalchemy[asyncio]>=2.0.43",
+    "asyncpg>=0.30",
+    "httpx>=0.28",
+    "pyjwt[crypto]>=2.10",
+    "anthropic>=0.69",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.2",
+    "mypy>=1.18",
+    "ruff>=0.14",
+    "pip-audit>=2.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app", "tests"]
+# Two carve-outs, two different reasons — neither is tidiness.
+#   1. `tests/services` : `ruff format` and `--fix` rewrite files from the shell,
+#      where no PreToolUse hook can see them. Reformatting a frozen test walks
+#      past the freeze and flips the RED marker's digest (07-backend.md).
+#   2. `.claude/` and `workflow.py` : the kit's own tooling, shipped as-is and
+#      written to another standard (no annotations, subprocess by design). All
+#      125 findings of the first repo-wide run were there and none in `app/` —
+#      a lint gate whose red never comes from this project's code is a gate that
+#      gets switched off. Ship it back upstream, don't reformat it here.
+extend-exclude = ["tests/services", ".claude", "workflow.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "ASYNC", "S"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["app"]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/main.py", "*/tests/*"]

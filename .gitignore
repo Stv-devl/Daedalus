@@ -1,0 +1,73 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Env — never committed
+.env
+.env.*
+!.env.example
+
+# Tests / coverage
+coverage/
+playwright-report/
+test-results/
+# Python coverage — 07-backend.md prescribes `--cov`, which writes these.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Supabase local
+supabase/.branches/
+supabase/.temp/
+
+# Vercel — `vercel link` writes the org and project ids here, and the CD
+# workflow builds .vercel/output/ (deploy.yml).
+.vercel/
+
+# OS / editors
+.DS_Store
+*.log
+.vscode/
+.idea/
+
+# === Claude workflow kit — not versioned ===
+# The kit is personal tooling, maintained upstream, not a deliverable of this
+# project. It stays on disk and keeps working — the hooks, the rules and the
+# commands are read from the filesystem, not from Git.
+#
+# What that costs, so nobody rediscovers it the hard way: a fresh clone has NO
+# guardrails. No TDD freeze, no architecture hook, no CLAUDE.md, no rules. The
+# CI is then the only enforcement that survives cloning, which is precisely why
+# `.github/workflows/` stays versioned.
+#
+# These paths were tracked by the bootstrap commit, so they were also detached
+# with `git rm --cached`: an ignore rule alone never stops Git following what it
+# already follows.
+.claude/
+CLAUDE.md
+AGENTS.md
+workflow.py
+workflow.sh
+codex-handoff.sh
+docs/Claude_Workflows.md
+docs/ADAPTATION.md
+docs/research-cache/
+
+# src/routeTree.gen.ts is deliberately NOT ignored, though TanStack Router
+# generates it. `pnpm build` is `tsc --noEmit && vite build`, and only the
+# second half writes that file: ignored, the CI typechecks a tree where it does
+# not exist yet and fails before ever building.
